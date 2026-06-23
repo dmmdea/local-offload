@@ -5,16 +5,21 @@ package pipeline
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/dmmdea/local-offload-pp-cli/internal/audioio"
 	"github.com/dmmdea/local-offload-pp-cli/internal/breaker"
 	"github.com/dmmdea/local-offload-pp-cli/internal/cache"
 	"github.com/dmmdea/local-offload-pp-cli/internal/confhead"
@@ -23,15 +28,19 @@ import (
 	"github.com/dmmdea/local-offload-pp-cli/internal/contextbudget"
 	"github.com/dmmdea/local-offload-pp-cli/internal/core"
 	"github.com/dmmdea/local-offload-pp-cli/internal/exemplars"
+	"github.com/dmmdea/local-offload-pp-cli/internal/gbnf"
 	"github.com/dmmdea/local-offload-pp-cli/internal/grounding"
+	"github.com/dmmdea/local-offload-pp-cli/internal/imagegen"
 	"github.com/dmmdea/local-offload-pp-cli/internal/imageio"
 	"github.com/dmmdea/local-offload-pp-cli/internal/ledger"
 	"github.com/dmmdea/local-offload-pp-cli/internal/llamaclient"
 	"github.com/dmmdea/local-offload-pp-cli/internal/parser"
 	"github.com/dmmdea/local-offload-pp-cli/internal/router"
+	"github.com/dmmdea/local-offload-pp-cli/internal/sttclient"
 	"github.com/dmmdea/local-offload-pp-cli/internal/tasks"
 	"github.com/dmmdea/local-offload-pp-cli/internal/validator"
 	"github.com/dmmdea/local-offload-pp-cli/internal/verifier"
+	"github.com/dmmdea/local-offload-pp-cli/internal/videoio"
 )
 
 type tierOverrides struct {
@@ -42,6 +51,7 @@ type tierOverrides struct {
 type Pipeline struct {
 	cfg        config.Config
 	client     *llamaclient.Client
+	stt        *sttclient.Client  // whisper-server transcribe client (audio never hits the text cascade)
 	cache      *cache.Cache       // may be nil
 	led        *ledger.Ledger     // may be nil
 	thresholds map[string]float64 // per-task conformal margin thresholds (Phase 2); nil = config constant
@@ -58,10 +68,11 @@ type Pipeline struct {
 
 func New(cfg config.Config, c *llamaclient.Client, ca *cache.Cache, l *ledger.Ledger) *Pipeline {
 	p := &Pipeline{cfg: cfg, client: c, cache: ca, led: l, lastHeal: map[string]time.Time{}}
-	p.thresholds = loadThresholds(cfg.ThresholdsPath)          // Phase 2
-	p.router = router.Load(cfg.RouterWeightsPath)              // Phase 5
-	p.overrides = loadOverrides(cfg.TierOverridesPath)         // Phase 4
-	p.breakers = breaker.NewGroup(5, 10, 20*time.Second)       // Phase 3: 5 infra-fails / 10-window, 20s cooldown
+	p.stt = sttclient.New(cfg.Endpoint, time.Duration(cfg.STTRequestTimeoutSec)*time.Second)
+	p.thresholds = loadThresholds(cfg.ThresholdsPath)    // Phase 2
+	p.router = router.Load(cfg.RouterWeightsPath)        // Phase 5
+	p.overrides = loadOverrides(cfg.TierOverridesPath)   // Phase 4
+	p.breakers = breaker.NewGroup(5, 10, 20*time.Second) // Phase 3: 5 infra-fails / 10-window, 20s cooldown
 	// Phase 2 Task 4: opt-in correctness gate. Loading is graceful — a missing
 	// weights/thresholds file leaves the head nil / map empty, so the gate is
 	// inert. Off entirely unless cfg.ConfHeadEnabled.
@@ -94,6 +105,27 @@ func (p *Pipeline) Run(ctx context.Context, req core.Request) core.Result {
 	// prompt/grammar to build here. It reuses the proven extract pipeline verbatim.
 	if req.Task == core.TaskExtractImage {
 		return p.runExtractImage(ctx, req, meta, start)
+	}
+
+	if req.Task == core.TaskVideoDescribe {
+		built, err := tasks.Build(req)
+		if err != nil {
+			return core.Deferf("build error: "+err.Error(), "", meta)
+		}
+		return p.runVideoDescribe(ctx, req, built, meta, start)
+	}
+
+	// transcribe converts req.Audio to 16kHz WAV then calls whisper-server. Its
+	// own branch (audio in, no prompt/grammar, never the text cascade).
+	if req.Task == core.TaskTranscribe {
+		return p.runTranscribe(ctx, req, meta, start)
+	}
+
+	// generate_image renders req.Input (the prompt) to a PNG on the local ComfyUI by
+	// shelling out to comfy-generate.mjs (which holds the GPU lock + ComfyUI lifecycle).
+	// Its own branch — no text cascade, no grammar, no vision call.
+	if req.Task == core.TaskGenerateImage {
+		return p.runGenerateImage(ctx, req, meta, start)
 	}
 
 	// Vision tasks (vqa) take a SEPARATE branch: the input is an image, not text,
@@ -181,6 +213,16 @@ func (p *Pipeline) Run(ctx context.Context, req core.Request) core.Result {
 			break
 		}
 	}
+	// Terminal LOCAL reasoning tier (grammar tasks only): after the whole cascade defers, give
+	// a thinking model one shot under a think-wrapped grammar to reclaim the deferral before
+	// falling through to Opus. A failure here defers exactly as before (never calls cloud).
+	if p.cfg.ReasoningModel != "" && built.Grammar != "" && !last.Meta.Truncated {
+		rres, ok := p.attemptReasoning(ctx, req, built, ck, meta, start)
+		if ok {
+			return rres
+		}
+		last = rres
+	}
 	p.recordDefer(req.Task, last.Meta, len(req.Input))
 	return last
 }
@@ -217,18 +259,25 @@ func (p *Pipeline) runVision(ctx context.Context, req core.Request, built tasks.
 		return core.Deferf("no vision model configured", "", meta)
 	}
 	meta.Model = p.cfg.VisionModel
-
-	// Resolve the image (local path or data URI -> data:image/...;base64 URI).
-	// A load failure is a user/input error, not infra: leave ErrClass empty.
 	dataURI, err := imageio.LoadImageB64(req.Image, p.cfg.VisionMaxImageBytes)
 	if err != nil {
 		meta.LatencyMs = time.Since(start).Milliseconds()
 		p.recordDefer(req.Task, meta, len(req.Input))
 		return core.Deferf("image load: "+err.Error(), "", meta)
 	}
+	return p.runVisionGen(ctx, req, built, meta, start, "img:"+sha256hex(dataURI), func(gctx context.Context) (llamaclient.GenResult, error) {
+		return p.client.GenerateVision(gctx, p.cfg.VisionModel, built.System, built.User, []string{dataURI}, built.Grammar, built.MaxTokens, p.cfg.Temperature, 0)
+	})
+}
 
-	// Cache key includes a hash of the image so distinct images never collide.
-	ck := cache.Key(string(req.Task), req.Input+"|img:"+sha256hex(dataURI), tasks.StableParamsKey(req.Params), p.cfg.VisionModel, built.Grammar)
+// runVisionGen owns the cache + ledger + defer/wrap machinery shared by the
+// single-image vision tasks and video_describe. `gen` is a closure that performs
+// the actual multimodal call (1 image for vqa/ocr/assess; interleaved frames for
+// video). cacheKeyExtra distinguishes inputs in the cache. No grammar/grounding/
+// confidence gate for the free-text tasks; a grammar-constrained vision task
+// (assess_image) surfaces its JSON verbatim. Any defer goes straight to Opus.
+func (p *Pipeline) runVisionGen(ctx context.Context, req core.Request, built tasks.Built, meta core.Meta, start time.Time, cacheKeyExtra string, gen func(context.Context) (llamaclient.GenResult, error)) core.Result {
+	ck := cache.Key(string(req.Task), req.Input+"|"+cacheKeyExtra, tasks.StableParamsKey(req.Params), p.cfg.VisionModel, built.Grammar)
 	if p.cache != nil {
 		if raw, ok := p.cache.Get(ck); ok {
 			var cv cacheVal
@@ -241,52 +290,395 @@ func (p *Pipeline) runVision(ctx context.Context, req core.Request, built tasks.
 			}
 		}
 	}
-
-	gen, gerr := p.client.GenerateVision(ctx, p.cfg.VisionModel, built.System, built.User, []string{dataURI}, built.Grammar, built.MaxTokens, p.cfg.Temperature, 0)
+	gres, gerr := gen(ctx)
 	if gerr != nil {
 		meta.LatencyMs = time.Since(start).Milliseconds()
 		meta.ErrClass = classifyErr(gerr)
 		p.recordDefer(req.Task, meta, len(req.Input))
 		return core.Deferf("vision model call failed: "+gerr.Error(), "", meta)
 	}
-	meta.TokensIn = gen.TokensIn
-	meta.TokensOut = gen.TokensOut
-	meta.TokPerSec = gen.TokPerSec
-	meta.Truncated = gen.Truncated
+	meta.TokensIn = gres.TokensIn
+	meta.TokensOut = gres.TokensOut
+	meta.TokPerSec = gres.TokPerSec
+	meta.Truncated = gres.Truncated
 	meta.LatencyMs = time.Since(start).Milliseconds()
 
-	answer := strings.TrimSpace(gen.Content)
+	answer := strings.TrimSpace(gres.Content)
 	if answer == "" {
 		p.recordDefer(req.Task, meta, len(req.Input))
-		return core.Deferf("empty vision output", gen.Content, meta)
+		return core.Deferf("empty vision output", gres.Content, meta)
 	}
-	if gen.Truncated {
-		// A larger local tier shares the 8GB ceiling; defer to Opus instead.
+	if gres.Truncated {
 		p.recordDefer(req.Task, meta, len(req.Input))
-		return core.Deferf("vision output truncated", gen.Content, meta)
+		return core.Deferf("vision output truncated", gres.Content, meta)
 	}
-
-	// A grammar-constrained vision task (assess_image) already returns a JSON
-	// object — surface it as Data verbatim, NOT wrapped in {key: content}. A
-	// free-text vision task (vqa/ocr) wraps its answer under a task-specific key.
 	var data json.RawMessage
 	if built.Grammar != "" {
 		if !json.Valid([]byte(answer)) {
-			// Shouldn't happen with a grammar active; defer rather than emit garbage.
 			p.recordDefer(req.Task, meta, len(req.Input))
-			return core.Deferf("non-JSON output from grammar vision task", gen.Content, meta)
+			return core.Deferf("non-JSON output from grammar vision task", gres.Content, meta)
 		}
 		data = json.RawMessage(answer)
 	} else {
 		data, _ = json.Marshal(map[string]string{visionResultKey(req.Task): answer})
 	}
 	if p.cache != nil {
-		if b, e := json.Marshal(cacheVal{Data: data, TokensIn: gen.TokensIn}); e == nil {
+		if b, e := json.Marshal(cacheVal{Data: data, TokensIn: gres.TokensIn}); e == nil {
 			_ = p.cache.Put(ck, b)
 		}
 	}
 	p.record(req.Task, meta, len(req.Input))
 	return core.Result{OK: true, Data: data, Meta: meta}
+}
+
+// runVideoDescribe samples frames from req.Video, builds <T.T seconds> timestamp
+// labels (from VideoFPS), and runs them interleaved through the vision tier. A
+// sampling failure (ffmpeg missing/bad video) is an input/infra error: defer.
+func (p *Pipeline) runVideoDescribe(ctx context.Context, req core.Request, built tasks.Built, meta core.Meta, start time.Time) core.Result {
+	if p.cfg.VisionModel == "" {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Input))
+		return core.Deferf("no vision model configured", "", meta)
+	}
+	meta.Model = p.cfg.VisionModel
+	fps := p.cfg.VideoFPS
+	if fps <= 0 {
+		fps = 1
+	}
+	// Sample frames and describe them. If the VLM rejects the request for
+	// exceeding its context window (a high-res / tall clip — e.g. a 4K vertical
+	// reel — can blow the ctx with the default frame budget), HALVE the frame
+	// RESOLUTION and retry: this keeps full temporal coverage (same frame count)
+	// rather than dropping frames, so the answer still spans the whole clip.
+	// Floor at 256px so we don't spiral into uselessly tiny frames.
+	width := p.cfg.VideoFrameWidth
+	if width <= 0 {
+		width = 512
+	}
+	for {
+		frames, err := videoio.SampleFrames(req.Video, p.cfg.FFmpegPath, p.cfg.VideoFPS, p.cfg.VideoMaxFrames, width, p.cfg.VisionMaxImageBytes)
+		if err != nil {
+			meta.LatencyMs = time.Since(start).Milliseconds()
+			p.recordDefer(req.Task, meta, len(req.Input))
+			return core.Deferf("frame sampling: "+err.Error(), "", meta)
+		}
+		labels := make([]string, len(frames))
+		for i := range frames {
+			labels[i] = fmt.Sprintf("<%.1f seconds>", float64(i)/fps)
+		}
+		extra := fmt.Sprintf("vid:%s|fps=%g|n=%d|w=%d|frames=%d", req.Video, p.cfg.VideoFPS, p.cfg.VideoMaxFrames, width, len(frames))
+		res := p.runVisionGen(ctx, req, built, meta, start, extra, func(gctx context.Context) (llamaclient.GenResult, error) {
+			return p.client.GenerateVisionInterleaved(gctx, p.cfg.VisionModel, built.System, labels, frames, built.User, built.Grammar, built.MaxTokens, p.cfg.Temperature, 0)
+		})
+		if res.OK || width <= 256 || !isContextOverflow(res.Reason) {
+			return res
+		}
+		width /= 2 // halve resolution, keep the frame count, retry to fit the ctx
+	}
+}
+
+// isContextOverflow reports whether a vision defer was caused by the request
+// exceeding the model's context window (too many / too-large frames for the
+// VLM's ctx). runVideoDescribe retries such cases at a lower frame resolution.
+func isContextOverflow(reason string) bool {
+	r := strings.ToLower(reason)
+	return strings.Contains(r, "exceeds the available context") ||
+		strings.Contains(r, "exceed_context_size") ||
+		strings.Contains(r, "context size")
+}
+
+// runTranscribe converts req.Audio to a 16kHz mono WAV (ffmpeg), transcribes it
+// on the whisper upstream, writes .srt/.txt/.segments.json to MediaDir, and
+// returns {gist, segments[](capped), language, duration_sec, num_segments,
+// *_path}. Any failure (no model / convert / model call / empty) defers to Opus.
+// It force-unloads the upstream after the call (zero-always-warm) unless
+// disabled. params: language (string), hq (bool -> the large-v3 upstream).
+func (p *Pipeline) runTranscribe(ctx context.Context, req core.Request, meta core.Meta, start time.Time) core.Result {
+	if p.cfg.STTModel == "" {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Audio))
+		return core.Deferf("no stt model configured", "", meta)
+	}
+	model := p.cfg.STTModel
+	if paramBool(req.Params, "hq") && p.cfg.STTModelHQ != "" {
+		model = p.cfg.STTModelHQ
+	}
+	meta.Model = model
+
+	lang := p.cfg.STTLanguage
+	if l := paramStr(req.Params, "language"); l != "" {
+		lang = l
+	}
+	if strings.EqualFold(lang, "auto") {
+		lang = ""
+	}
+
+	// Convert first (cheap, deterministic). A bad/missing file defers here.
+	wav, cleanup, cerr := audioio.ConvertToWav16k(req.Audio, p.cfg.FFmpegPath)
+	if cerr != nil {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Audio))
+		return core.Deferf("audio convert: "+cerr.Error(), "", meta)
+	}
+	defer cleanup()
+
+	// Identity = source file (path+size+mtime) + model + lang. Used for BOTH the
+	// cache key AND the on-disk media filename so they agree and never collide
+	// across distinct sources that share a basename (recording.m4a is common in
+	// field audio) or across model/lang variants of the same source.
+	ident := req.Audio + "|" + audioCacheExtra(req.Audio, model, lang)
+	ck := cache.Key("transcribe", ident, tasks.StableParamsKey(req.Params), model, "")
+	if p.cache != nil {
+		if raw, ok := p.cache.Get(ck); ok {
+			var cv cacheVal
+			if json.Unmarshal(raw, &cv) == nil && len(cv.Data) > 0 {
+				meta.CacheHit = true
+				meta.LatencyMs = time.Since(start).Milliseconds()
+				p.record(req.Task, meta, len(req.Audio))
+				return core.Result{OK: true, Data: cv.Data, Meta: meta}
+			}
+		}
+	}
+
+	prm := sttclient.DefaultParams()
+	prm.Language = lang
+	if !p.cfg.STTVAD {
+		prm.VAD = false
+	}
+	tr, terr := p.stt.Transcribe(ctx, model, wav, prm)
+	// zero-always-warm: free the upstream's VRAM now (best-effort, short timeout).
+	if p.cfg.STTUnloadAfter {
+		uctx, ucancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = p.stt.Unload(uctx, model)
+		ucancel()
+	}
+	if terr != nil {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		meta.ErrClass = classifyErr(terr)
+		p.recordDefer(req.Task, meta, len(req.Audio))
+		return core.Deferf("transcribe call failed: "+terr.Error(), "", meta)
+	}
+	full := strings.TrimSpace(tr.Text)
+	if full == "" && len(tr.Segments) == 0 {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Audio))
+		return core.Deferf("empty transcript", "", meta)
+	}
+
+	// Write the full payload to disk (the pointer pattern) — best-effort: a write
+	// failure does not fail the result (the inline data still carries the answer).
+	base := mediaBase(p.cfg.MediaDir, req.Audio, ident)
+	srtPath, txtPath, jsonPath := base+".srt", base+".txt", base+".segments.json"
+	_ = os.MkdirAll(filepath.Dir(base), 0o755)
+	_ = os.WriteFile(srtPath, []byte(sttclient.SRT(tr.Segments)), 0o644)
+	_ = os.WriteFile(txtPath, []byte(full), 0o644)
+	if sj, e := json.MarshalIndent(tr.Segments, "", "  "); e == nil {
+		_ = os.WriteFile(jsonPath, sj, 0o644)
+	}
+
+	// Inline a capped set of segments; the rest live in jsonPath.
+	segs := tr.Segments
+	truncated := false
+	if p.cfg.STTMaxInlineSegments > 0 && len(segs) > p.cfg.STTMaxInlineSegments {
+		segs = segs[:p.cfg.STTMaxInlineSegments]
+		truncated = true
+	}
+
+	out := transcribeResult{
+		Language:          tr.Language,
+		DurationSec:       tr.Duration,
+		NumSegments:       len(tr.Segments),
+		Gist:              preview(full, 400),
+		Segments:          segs,
+		SegmentsTruncated: truncated,
+		SRTPath:           srtPath,
+		TextPath:          txtPath,
+		JSONPath:          jsonPath,
+	}
+	data, _ := json.Marshal(out)
+	if p.cache != nil {
+		if b, e := json.Marshal(cacheVal{Data: data}); e == nil {
+			_ = p.cache.Put(ck, b)
+		}
+	}
+	meta.LatencyMs = time.Since(start).Milliseconds()
+	p.record(req.Task, meta, len(req.Audio))
+	return core.Result{OK: true, Data: data, Meta: meta}
+}
+
+// transcribeResult is the offload_transcribe payload (the {gist, segments[]}
+// citation pattern + on-disk pointers).
+type transcribeResult struct {
+	Language          string              `json:"language"`
+	DurationSec       float64             `json:"duration_sec"`
+	NumSegments       int                 `json:"num_segments"`
+	Gist              string              `json:"gist"`
+	Segments          []sttclient.Segment `json:"segments"`
+	SegmentsTruncated bool                `json:"segments_truncated"`
+	SRTPath           string              `json:"srt_path"`
+	TextPath          string              `json:"text_path"`
+	JSONPath          string              `json:"json_path"`
+}
+
+// mediaBase returns <MediaDir>/<sanitized-basename>-<8hex of ident> as the
+// output stem. The ident hash disambiguates distinct sources that share a
+// basename (e.g. two different recording.m4a) or model/lang variants of one
+// source, so the returned .srt/.txt/.segments.json pointers never reference a
+// different audio's transcript. ident is the SAME identity used for the cache
+// key, so on-disk files and cache entries agree.
+func mediaBase(mediaDir, audioPath, ident string) string {
+	name := filepath.Base(audioPath)
+	if ext := filepath.Ext(name); ext != "" {
+		name = name[:len(name)-len(ext)]
+	}
+	name = sanitizeStem(name)
+	if name == "" || name == "." {
+		name = "transcript"
+	}
+	return filepath.Join(mediaDir, name+"-"+sha256hex(ident)[:8])
+}
+
+// runGenerateImage renders req.Input (the prompt) to a PNG on the LOCAL ComfyUI by shelling
+// out to comfy-generate.mjs (which takes the shared GPU lock and starts/stops ComfyUI). Its
+// own branch — no text models, no grammar, no vision call. Any failure (no route, empty
+// prompt, ComfyUI down, render error, timeout) defers to Claude. params: negative (string),
+// width/height/steps/seed (int).
+func (p *Pipeline) runGenerateImage(ctx context.Context, req core.Request, meta core.Meta, start time.Time) core.Result {
+	if p.cfg.ImageGenScript == "" {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Input))
+		return core.Deferf("no image-gen route configured", "", meta)
+	}
+	prompt := strings.TrimSpace(req.Input)
+	if prompt == "" {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		p.recordDefer(req.Task, meta, len(req.Input))
+		return core.Deferf("empty image prompt", "", meta)
+	}
+	meta.Model = "comfyui-sdxl"
+
+	// Pin a concrete seed BEFORE the render so the reported seed matches what ComfyUI actually
+	// used: comfy-render picks a RANDOM seed when none is supplied, so without this the result
+	// would report seed:0 — wrong, and defeating the documented reproducibility. Honor a
+	// caller-supplied positive seed; otherwise mint one and thread it through req.Params.
+	seed := paramIntOr(req.Params, "seed", 0)
+	if seed <= 0 {
+		seed = mintSeed()
+		if req.Params == nil {
+			req.Params = map[string]any{}
+		}
+		req.Params["seed"] = seed
+	}
+
+	// Output path: caller's "out", else a stable name under MediaDir (identical prompt+params
+	// reuse one file; a seed/size change varies the hash).
+	out := paramStr(req.Params, "out")
+	if out == "" {
+		_ = os.MkdirAll(p.cfg.MediaDir, 0o755)
+		out = filepath.Join(p.cfg.MediaDir, "render-"+sha256hex(prompt + tasks.StableParamsKey(req.Params))[:8]+".png")
+	}
+
+	timeout := time.Duration(p.cfg.ImageGenTimeoutSec) * time.Second
+	outPath, gerr := imagegen.Generate(ctx, p.cfg.NodePath, p.cfg.ImageGenScript, p.cfg.ComfyDir, out, prompt, req.Params, timeout)
+	if gerr != nil {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		meta.ErrClass = classifyErr(gerr)
+		p.recordDefer(req.Task, meta, len(req.Input))
+		return core.Deferf("image generation failed: "+gerr.Error(), "", meta)
+	}
+	meta.LatencyMs = time.Since(start).Milliseconds()
+	data, _ := json.Marshal(map[string]any{
+		"image_path": outPath,
+		"width":      paramIntOr(req.Params, "width", 1024),
+		"height":     paramIntOr(req.Params, "height", 1024),
+		"seed":       seed,
+	})
+	p.record(req.Task, meta, len(prompt))
+	return core.Result{OK: true, Data: data, Meta: meta}
+}
+
+// mintSeed returns a random positive seed (1..1e9) so an unspecified-seed render is still
+// reproducible — the value is threaded into the render and reported back to the caller.
+func mintSeed() int {
+	n, err := crand.Int(crand.Reader, big.NewInt(1_000_000_000))
+	if err != nil {
+		return 1
+	}
+	return int(n.Int64()) + 1
+}
+
+// paramIntOr reads an int param (int / int64 / float64), or def if absent.
+func paramIntOr(p map[string]any, k string, def int) int {
+	switch n := p[k].(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return def
+}
+
+// sanitizeStem replaces path separators and Windows-illegal filename characters
+// with '_' so a media file always writes cleanly regardless of the source name.
+func sanitizeStem(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// audioCacheExtra folds the source file identity (path+size+modtime) + model +
+// language into the cache key so a changed file or a different model/lang misses.
+func audioCacheExtra(audioPath, model, lang string) string {
+	var sz, mt int64
+	if fi, err := os.Stat(audioPath); err == nil {
+		sz = fi.Size()
+		mt = fi.ModTime().UnixNano()
+	}
+	return fmt.Sprintf("sz=%d|mt=%d|model=%s|lang=%s", sz, mt, model, lang)
+}
+
+// preview returns roughly the first n bytes of s trimmed at a word boundary,
+// with an ellipsis when truncated — a cheap, deterministic gist (no model call).
+// It is rune-safe: n may land mid-rune (e.g. a Spanish á/ñ), so any trailing
+// partial UTF-8 rune is trimmed before returning.
+func preview(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n]
+	if i := strings.LastIndexByte(cut, ' '); i > n/2 {
+		cut = cut[:i]
+	}
+	for len(cut) > 0 && !utf8.ValidString(cut) { // drop a split multibyte rune
+		cut = cut[:len(cut)-1]
+	}
+	return strings.TrimSpace(cut) + "…"
+}
+
+// paramBool reads a bool param (JSON decodes to bool; tolerate "true").
+func paramBool(p map[string]any, k string) bool {
+	switch v := p[k].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	}
+	return false
+}
+
+// paramStr reads a string param.
+func paramStr(p map[string]any, k string) string {
+	if v, ok := p[k].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // sha256hex returns the hex-encoded SHA-256 of s (used to fold an image into the
@@ -446,6 +838,68 @@ func (p *Pipeline) attempt(ctx context.Context, req core.Request, built tasks.Bu
 	return core.Deferf("exhausted retries", lastContent, meta), true
 }
 
+// reasoningThinkBudget is extra generation budget granted to the reasoning tier on top of a
+// task's native budget, so the grammar-forced <think> span has room before the JSON answer.
+const reasoningThinkBudget = 512
+
+// attemptReasoning is the terminal LOCAL tier for grammar tasks: a thinking model reasons
+// under a think-wrapped grammar (gbnf.WrapThinking), the <think> span is stripped, then the
+// SAME verify + validate + grounding gates as attempt() run. It is deliberately simpler than
+// attempt — no retries and no confidence-escalation gate (there is no larger local tier to
+// escalate to; a valid answer here reclaims a cloud deferral, an invalid one falls through to
+// the normal defer-to-Opus). Returns (result, ok). On ok the result is recorded + cached; a
+// defer is NOT recorded (Run records the final one once).
+func (p *Pipeline) attemptReasoning(ctx context.Context, req core.Request, built tasks.Built, ck string, meta core.Meta, start time.Time) (core.Result, bool) {
+	meta.Model = p.cfg.ReasoningModel
+	meta.Reasoning = true // tag every reasoning-tier outcome so a reclaim is distinguishable from an escalation answer (same model)
+	wrapped := gbnf.WrapThinking(built.Grammar)
+	// The wrapped grammar emits a <think> span BEFORE the JSON, so the task's native token
+	// budget (classify=64, assess=128) would truncate the reasoning before any answer. Give the
+	// think span headroom on top of the original budget.
+	gen, gerr := p.client.Generate(ctx, p.cfg.ReasoningModel, built.System, built.User, wrapped, built.MaxTokens+reasoningThinkBudget, p.cfg.Temperature, 0)
+	if gerr != nil {
+		meta.LatencyMs = time.Since(start).Milliseconds()
+		meta.ErrClass = classifyErr(gerr)
+		return core.Deferf("reasoning model call failed: "+gerr.Error(), "", meta), false
+	}
+	content := parser.StripThink(gen.Content)
+	meta.TokensIn = gen.TokensIn
+	meta.TokensOut = gen.TokensOut
+	meta.TokPerSec = gen.TokPerSec
+	meta.Truncated = gen.Truncated
+
+	data, perr := parser.Extract(content)
+	v := verifier.Check(content, gen.Truncated, perr)
+	if v.OK {
+		if verr := validator.Validate(data, built.Schema); verr != nil {
+			v = verifier.Verdict{Reason: "schema: " + verr.Error()}
+		} else if g, ok := grounding.Check(req.Task, req.Input, data); ok {
+			meta.Grounded = &g
+			if !g && req.Task == core.TaskExtract {
+				v = verifier.Verdict{Reason: "ungrounded extract (values not in source)"}
+			}
+		}
+	}
+	// Classify self-confidence: honor the same accept/defer gate the cascade uses, so a
+	// model-flagged-unsure classify answer defers (to Opus) rather than being accepted here.
+	if v.OK && req.Task == core.TaskClassify {
+		if conf, low := lowConfidence(data, p.cfg.ClassifyMinConfidence); low {
+			v = verifier.Verdict{Reason: fmt.Sprintf("low classify confidence %.2f < %.2f", conf, p.cfg.ClassifyMinConfidence)}
+		}
+	}
+	meta.LatencyMs = time.Since(start).Milliseconds()
+	if !v.OK {
+		return core.Deferf("reasoning tier: "+v.Reason, gen.Content, meta), false
+	}
+	if p.cache != nil {
+		if b, e := json.Marshal(cacheVal{Data: data, TokensIn: gen.TokensIn}); e == nil {
+			_ = p.cache.Put(ck, b)
+		}
+	}
+	p.record(req.Task, meta, len(req.Input))
+	return core.Result{OK: true, Data: data, Meta: meta}, true
+}
+
 // modelChain returns the ascending-capability tiers for a task. Fast tasks enter
 // at the small tier — UNLESS the learned router predicts it will fail on this
 // input (Phase 5) or health marked it degraded (Phase 4), in which case the
@@ -503,7 +957,8 @@ func entryFrom(task core.TaskType, meta core.Meta, deferred bool, inputChars int
 		LatencyMs: meta.LatencyMs, TokPerSec: meta.TokPerSec, CacheHit: meta.CacheHit,
 		Deferred: deferred,
 		Margin:   meta.Margin, ModelTier: meta.Model, Escalations: meta.Escalations,
-		Retries: meta.Retries, Truncated: meta.Truncated, Grounded: meta.Grounded,
+		Reasoning: meta.Reasoning,
+		Retries:   meta.Retries, Truncated: meta.Truncated, Grounded: meta.Grounded,
 		EscalatedAgreed: meta.EscalatedAgreed, ErrClass: meta.ErrClass,
 		InputChars: inputChars, Feat: meta.Feat,
 	}

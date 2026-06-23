@@ -3,6 +3,7 @@ package ledger
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -97,6 +98,33 @@ func TestReadLabelFileMissingIsNil(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("missing file should return nil slice, got %v", got)
+	}
+}
+
+// TestSummarizeCountsReasoningReclaims: ReasoningReclaims counts ONLY completed
+// entries flagged reasoning (a reclaimed deferral). A reasoning attempt that still
+// deferred is not a reclaim, and pre-field ledger lines (no "reasoning" key) are
+// back-compat non-reasoning.
+func TestSummarizeCountsReasoningReclaims(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ledger.jsonl")
+	lines := []string{
+		`{"ts":1,"task":"triage","deferred":false}`,                    // pre-field completed -> not a reclaim
+		`{"ts":2,"task":"classify","deferred":false,"reasoning":true}`, // reclaim (completed + flagged)
+		`{"ts":3,"task":"triage","deferred":true,"reasoning":true}`,    // reasoning attempt that DEFERRED -> not a reclaim
+		`{"ts":4,"task":"extract","deferred":false,"reasoning":true}`,  // reclaim
+	}
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := SummarizeFile(p, 0, 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ReasoningReclaims != 2 {
+		t.Fatalf("want 2 reasoning reclaims (completed+flagged only), got %d", s.ReasoningReclaims)
+	}
+	if s.Completed != 3 { // entries 1,2,4 completed; entry 3 deferred
+		t.Fatalf("want 3 completed, got %d", s.Completed)
 	}
 }
 

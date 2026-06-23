@@ -27,12 +27,66 @@ type Config struct {
 	// EscalationModel is tried once when the primary defers (validation fail / low
 	// confidence) BEFORE deferring to Opus. Empty = no escalation (defer directly).
 	EscalationModel string `json:"escalation_model"`
+	// ReasoningModel is the terminal LOCAL tier (grammar tasks only): after the whole
+	// cascade defers, a thinking model gets one shot under a think-wrapped grammar
+	// (gbnf.WrapThinking) to reclaim the deferral before falling through to Opus. Run
+	// it thinking-OFF — the grammar, not the chat template, supplies the <think> span.
+	// Empty = no reasoning tier (defer straight to Opus, the prior behavior).
+	ReasoningModel string `json:"reasoning_model,omitempty"`
 	// VisionModel is the VLM alias used for the vqa task (multimodal). Empty = no
 	// vision route (vqa defers).
 	VisionModel string `json:"vision_model,omitempty"`
 	// VisionMaxImageBytes caps a single decoded image before it is rejected
 	// (guards context/VRAM blowups). 0 = use the loader default.
 	VisionMaxImageBytes int `json:"vision_max_image_bytes,omitempty"`
+	// VideoFPS is the frame-sampling rate for video_describe (frames/second).
+	VideoFPS float64 `json:"video_fps,omitempty"`
+	// VideoMaxFrames caps how many sampled frames are sent to the VLM (bounds the
+	// 8GB activation budget — frames, not weights, are the VRAM pressure).
+	VideoMaxFrames int `json:"video_max_frames,omitempty"`
+	// VideoFrameWidth scales each sampled frame to this width (px), aspect kept.
+	VideoFrameWidth int `json:"video_frame_width,omitempty"`
+	// FFmpegPath is the ffmpeg executable used to sample frames. Default "ffmpeg".
+	FFmpegPath string `json:"ffmpeg_path,omitempty"`
+	// --- STT / transcribe (Phase A.2) ---
+	// STTModel is the llama-swap alias for the default whisper-server upstream
+	// (large-v3-turbo). Empty = no STT route (transcribe defers).
+	STTModel string `json:"stt_model,omitempty"`
+	// STTModelHQ is the quality-escalation whisper upstream (large-v3), used when
+	// a transcribe request passes hq=true. Empty = hq falls back to STTModel.
+	STTModelHQ string `json:"stt_model_hq,omitempty"`
+	// STTLanguage forces the transcription language ("en"/"es"); "" = auto-detect.
+	// Per-call params["language"] overrides this. Forcing is more reliable on
+	// noisy/code-switching field audio than auto-detect.
+	STTLanguage string `json:"stt_language,omitempty"`
+	// STTVAD enables Silero VAD (server launched with -vm + --vad) — the biggest
+	// hallucination reducer on noisy field audio. Default true.
+	STTVAD bool `json:"stt_vad,omitempty"`
+	// STTMaxInlineSegments caps how many timestamped segments are inlined in the
+	// result (the rest live in the on-disk .segments.json pointer). Default 120.
+	STTMaxInlineSegments int `json:"stt_max_inline_segments,omitempty"`
+	// STTUnloadAfter force-unloads the whisper upstream after each transcription
+	// (zero-always-warm). Default true; set false for a known batch loop.
+	STTUnloadAfter bool `json:"stt_unload_after,omitempty"`
+	// STTRequestTimeoutSec bounds one transcription HTTP call (long audio at
+	// 5-8x realtime). Default 1800 (30 min). Separate from RequestTimeoutSec.
+	STTRequestTimeoutSec int `json:"stt_request_timeout_sec,omitempty"`
+	// MediaDir is where transcribe writes .srt/.txt/.segments.json. Default
+	// <base>/media.
+	MediaDir string `json:"media_dir,omitempty"`
+	// --- image generation (generate_image) ---
+	// ImageGenScript is the absolute path to render/comfy-generate.mjs (the Node
+	// lifecycle wrapper around comfy-render.mjs). Empty = no image route (the task
+	// defers), exactly like an empty STTModel/VisionModel.
+	ImageGenScript string `json:"imagegen_script,omitempty"`
+	// NodePath is the node executable used to run the image script. Default "node".
+	NodePath string `json:"node_path,omitempty"`
+	// ComfyDir is the local ComfyUI install dir (passed to the script as COMFY_DIR).
+	// Default "C:/ComfyUI".
+	ComfyDir string `json:"comfy_dir,omitempty"`
+	// ImageGenTimeoutSec bounds one render: ComfyUI cold-start (~4min) + first SDXL
+	// render (~6min) + margin. Default 720 (12min).
+	ImageGenTimeoutSec int `json:"imagegen_timeout_sec,omitempty"`
 	// Temperature for deterministic structured output (default 0).
 	Temperature float64 `json:"temperature"`
 	// MaxRetries is how many correction re-prompts before deferring.
@@ -51,17 +105,17 @@ type Config struct {
 	LedgerPath string `json:"ledger_path"`
 	// --- self-learning artifacts (written by the offline `calibrate`/`health`/
 	// `train-router`/`optimize` jobs; read at pipeline startup). Empty = feature off. ---
-	ThresholdsPath    string             `json:"thresholds_path,omitempty"`     // Phase 2: per-task conformal margin thresholds
-	TierOverridesPath string             `json:"tier_overrides_path,omitempty"` // Phase 4: health-driven entry-tier bumps + P95 timeouts
-	RouterWeightsPath string             `json:"router_weights_path,omitempty"` // Phase 5: logistic entry-tier router
-	ConfHeadPath           string         `json:"confhead_path,omitempty"`            // Phase 2: logistic correctness head
-	ConfHeadLabelsPath     string         `json:"confhead_labels_path,omitempty"`     // Phase 2: cascade-agreement correctness-label sidecar (classify/triage)
-	ConfHeadThresholdsPath string         `json:"confhead_thresholds_path,omitempty"` // Phase 2: per-task conformal p(correct) escalation thresholds (Task 3)
-	ConfHeadEnabled        bool           `json:"confhead_enabled,omitempty"`         // Phase 2 Task 4: opt-in — gate ADOPT tasks on the head's p(correct). Default false.
-	ExemplarsDir      string             `json:"exemplars_dir,omitempty"`       // Phase 6: few-shot exemplar sidecar + selected pool
-	ExemplarShots     int                `json:"exemplar_shots,omitempty"`      // Phase 6: 0 = disabled
-	AutoHeal          bool               `json:"auto_heal,omitempty"`           // Phase 7: opt-in autonomous tier reload
-	TargetErrorRate   map[string]float64 `json:"target_error_rate,omitempty"`   // Phase 2: per-task α for calibration
+	ThresholdsPath         string             `json:"thresholds_path,omitempty"`          // Phase 2: per-task conformal margin thresholds
+	TierOverridesPath      string             `json:"tier_overrides_path,omitempty"`      // Phase 4: health-driven entry-tier bumps + P95 timeouts
+	RouterWeightsPath      string             `json:"router_weights_path,omitempty"`      // Phase 5: logistic entry-tier router
+	ConfHeadPath           string             `json:"confhead_path,omitempty"`            // Phase 2: logistic correctness head
+	ConfHeadLabelsPath     string             `json:"confhead_labels_path,omitempty"`     // Phase 2: cascade-agreement correctness-label sidecar (classify/triage)
+	ConfHeadThresholdsPath string             `json:"confhead_thresholds_path,omitempty"` // Phase 2: per-task conformal p(correct) escalation thresholds (Task 3)
+	ConfHeadEnabled        bool               `json:"confhead_enabled,omitempty"`         // Phase 2 Task 4: opt-in — gate ADOPT tasks on the head's p(correct). Default false.
+	ExemplarsDir           string             `json:"exemplars_dir,omitempty"`            // Phase 6: few-shot exemplar sidecar + selected pool
+	ExemplarShots          int                `json:"exemplar_shots,omitempty"`           // Phase 6: 0 = disabled
+	AutoHeal               bool               `json:"auto_heal,omitempty"`                // Phase 7: opt-in autonomous tier reload
+	TargetErrorRate        map[string]float64 `json:"target_error_rate,omitempty"`        // Phase 2: per-task α for calibration
 	// OpusInputPricePerMTok estimates dollar savings ($ per 1M input tokens).
 	OpusInputPricePerMTok float64 `json:"opus_input_price_per_mtok"`
 	// RequestTimeoutSec for a single model call.
@@ -73,31 +127,48 @@ func Default() Config {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".local-offload")
 	return Config{
-		Endpoint:              "http://127.0.0.1:11436",
-		CompletionPath:        "/v1/chat/completions", // chat route: server applies the Gemma template; we pass a raw "grammar" field
-		Model:                 "offload-e4b",
-		TriageModel:           "gemma4-e2b",     // fast tier for triage/classify
-		EscalationModel:       "gemma4-26b-a4b", // near-frontier MoE, tried before defer-to-Opus
-		VisionModel:           "qwen3vl-4b",     // VLM for the vqa task
-		VisionMaxImageBytes:   6000000,          // ~6MB cap per image
+		Endpoint:                  "http://127.0.0.1:11436",
+		CompletionPath:            "/v1/chat/completions", // chat route: server applies the Gemma template; we pass a raw "grammar" field
+		Model:                     "offload-e4b",
+		TriageModel:               "gemma4-e2b",     // fast tier for triage/classify
+		EscalationModel:           "qwythos", // Qwen3.5-9B SFT; ties gemma4-26b-a4b on mechanical, smaller/faster (2026-06-21). gemma4-26b-a4b kept in llama-swap for rollback.
+		ReasoningModel:            "qwythos", // terminal local reasoning tier (think-wrapped grammar) before defer-to-Opus. Eval (29 hard cases): reclaims deferred classify 2/2 correctly (cov 88->100%, acc held 100%); never hurt. "" disables.
+		VisionModel:               "qwen3vl-4b",     // VLM for the vqa task
+		VisionMaxImageBytes:       6000000,          // ~6MB cap per image
+		VideoFPS:                  2.0,
+		VideoMaxFrames:            12,
+		VideoFrameWidth:           512,
+		FFmpegPath:                "ffmpeg",
+		STTModel:                  "whisper-stt",
+		STTModelHQ:                "whisper-stt-hq",
+		STTLanguage:               "", // auto-detect unless overridden per call
+		STTVAD:                    true,
+		STTMaxInlineSegments:      120,
+		STTUnloadAfter:            true,
+		STTRequestTimeoutSec:      1800,
+		MediaDir:                  filepath.Join(base, "media"),
+		ImageGenScript:            "render/comfy-generate.mjs",
+		NodePath:                  "node",
+		ComfyDir:                  "C:/ComfyUI",
+		ImageGenTimeoutSec:        720,
 		Temperature:               0,
 		MaxRetries:                1,
 		ClassifyMinConfidence:     0.45,
 		ConfidenceMarginThreshold: 0.35,
-		MaxInputChars:         24000, // ~6k tokens, well under ctx 8192
-		CachePath:             filepath.Join(base, "cache.db"),
-		LedgerPath:            filepath.Join(base, "ledger.jsonl"), // append-only JSONL (concurrent read/append)
-		ThresholdsPath:        filepath.Join(base, "thresholds.json"),
-		TierOverridesPath:     filepath.Join(base, "tier_overrides.json"),
-		RouterWeightsPath:     filepath.Join(base, "router-weights.json"),
-		ConfHeadPath:           filepath.Join(base, "confhead-weights.json"),
-		ConfHeadLabelsPath:     filepath.Join(base, "confhead-labels.jsonl"),
-		ConfHeadThresholdsPath: filepath.Join(base, "confhead-thresholds.json"),
-		ExemplarsDir:          filepath.Join(base, "exemplars"),
-		ExemplarShots:         0, // off until the pool is built + measured
-		AutoHeal:              false,
-		OpusInputPricePerMTok: 15.0,
-		RequestTimeoutSec:     120,
+		MaxInputChars:             24000, // ~6k tokens, well under ctx 8192
+		CachePath:                 filepath.Join(base, "cache.db"),
+		LedgerPath:                filepath.Join(base, "ledger.jsonl"), // append-only JSONL (concurrent read/append)
+		ThresholdsPath:            filepath.Join(base, "thresholds.json"),
+		TierOverridesPath:         filepath.Join(base, "tier_overrides.json"),
+		RouterWeightsPath:         filepath.Join(base, "router-weights.json"),
+		ConfHeadPath:              filepath.Join(base, "confhead-weights.json"),
+		ConfHeadLabelsPath:        filepath.Join(base, "confhead-labels.jsonl"),
+		ConfHeadThresholdsPath:    filepath.Join(base, "confhead-thresholds.json"),
+		ExemplarsDir:              filepath.Join(base, "exemplars"),
+		ExemplarShots:             0, // off until the pool is built + measured
+		AutoHeal:                  false,
+		OpusInputPricePerMTok:     15.0,
+		RequestTimeoutSec:         120,
 	}
 }
 
@@ -156,6 +227,11 @@ func (c Config) EnsureDirs() error {
 	}
 	if c.ExemplarsDir != "" { // a directory, not a file
 		if err := os.MkdirAll(c.ExemplarsDir, 0o755); err != nil {
+			return err
+		}
+	}
+	if c.MediaDir != "" { // a directory, not a file
+		if err := os.MkdirAll(c.MediaDir, 0o755); err != nil {
 			return err
 		}
 	}

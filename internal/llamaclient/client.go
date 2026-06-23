@@ -228,6 +228,61 @@ func (c *Client) GenerateVision(ctx context.Context, model, system, user string,
 	return decodeGenResult(resp, start)
 }
 
+// GenerateVisionInterleaved sends a multimodal chat request whose user content
+// INTERLEAVES a text label before each image (frameLabels[i] then image[i]),
+// then appends trailingUser as the final text part. This matches Qwen3-VL's
+// trained "<timestamp> frame" interleaved format (its MRoPE uses the timestamp
+// tokens for temporal localization). frameLabels and imageDataURIs pair by index;
+// a missing/empty label is skipped for that image. Shares decodeGenResult; like
+// GenerateVision, CachePrompt is forced OFF (llama.cpp #17200).
+func (c *Client) GenerateVisionInterleaved(ctx context.Context, model, system string, frameLabels, imageDataURIs []string, trailingUser, grammar string, maxTokens int, temperature float64, topLogprobs int) (GenResult, error) {
+	if model == "" {
+		model = c.model
+	}
+	userParts := make([]contentPart, 0, 2*len(imageDataURIs)+1)
+	for i, uri := range imageDataURIs {
+		if i < len(frameLabels) && frameLabels[i] != "" {
+			userParts = append(userParts, contentPart{Type: "text", Text: frameLabels[i]})
+		}
+		userParts = append(userParts, contentPart{Type: "image_url", ImageURL: &imageURL{URL: uri}})
+	}
+	if trailingUser != "" {
+		userParts = append(userParts, contentPart{Type: "text", Text: trailingUser})
+	}
+	body := mmChatReq{
+		Model:       model,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+		Grammar:     grammar,
+		CachePrompt: false,
+		Messages:    []mmMsg{},
+	}
+	if topLogprobs > 0 {
+		body.Logprobs = true
+		body.TopLogprobs = topLogprobs
+	}
+	if system != "" {
+		body.Messages = append(body.Messages, mmMsg{Role: "system", Content: []contentPart{{Type: "text", Text: system}}})
+	}
+	body.Messages = append(body.Messages, mmMsg{Role: "user", Content: userParts})
+
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return GenResult{}, err
+	}
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+c.path, bytes.NewReader(buf))
+	if err != nil {
+		return GenResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return GenResult{}, err
+	}
+	return decodeGenResult(resp, start)
+}
+
 // decodeGenResult turns a llama-server chat response into a GenResult. It owns
 // status handling, body decode, and per-call telemetry (incl. raw logprobs), so
 // both Generate (text) and GenerateVision (multimodal) share one decode path.

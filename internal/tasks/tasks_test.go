@@ -61,3 +61,19 @@ func TestBuildOCR(t *testing.T) {
 		t.Errorf("ocr MaxTokens = %d, want >= 1024 (OCR output can be long)", b.MaxTokens)
 	}
 }
+
+func TestBuildVideoDescribe(t *testing.T) {
+	if _, err := Build(core.Request{Task: core.TaskVideoDescribe}); err == nil {
+		t.Fatal("video_describe with no question must error")
+	}
+	b, err := Build(core.Request{Task: core.TaskVideoDescribe, Params: map[string]any{"question": "what happens?"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if b.Grammar != "" {
+		t.Error("video_describe is free-text; grammar must be empty")
+	}
+	if b.User != "what happens?" {
+		t.Errorf("User = %q, want the question verbatim", b.User)
+	}
+}

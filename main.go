@@ -18,6 +18,7 @@ import (
 
 	"github.com/dmmdea/local-offload-pp-cli/internal/cache"
 	"github.com/dmmdea/local-offload-pp-cli/internal/calibration"
+	"github.com/dmmdea/local-offload-pp-cli/internal/confhead"
 	"github.com/dmmdea/local-offload-pp-cli/internal/config"
 	"github.com/dmmdea/local-offload-pp-cli/internal/core"
 	"github.com/dmmdea/local-offload-pp-cli/internal/eval"
@@ -28,7 +29,6 @@ import (
 	"github.com/dmmdea/local-offload-pp-cli/internal/mcpserver"
 	"github.com/dmmdea/local-offload-pp-cli/internal/pipeline"
 	"github.com/dmmdea/local-offload-pp-cli/internal/report"
-	"github.com/dmmdea/local-offload-pp-cli/internal/confhead"
 	"github.com/dmmdea/local-offload-pp-cli/internal/router"
 )
 
@@ -46,6 +46,12 @@ func main() {
 		err = runTask(sub, args)
 	case "vqa":
 		err = runVQA(args)
+	case "video-describe":
+		err = runVideoDescribe(args)
+	case "transcribe":
+		err = runTranscribe(args)
+	case "generate-image":
+		err = runGenerateImage(args)
 	case "ocr":
 		err = runOCR(args)
 	case "extract-image":
@@ -143,6 +149,8 @@ Usage:
   local-offload extract   <file|-> --schema schema.json [--json]
   local-offload triage    <file|-> --question "..." [--json]
   local-offload vqa       <image-path> --question "..." [--json]
+  local-offload video-describe <video-path> --question "..." [--json]
+  local-offload transcribe <audio-path> [--language es] [--hq] [--json]
   local-offload ocr       <image-path> [--json]
   local-offload extract-image <image-path> --schema schema.json [--json]
   local-offload assess-image <image-path> [--brief "..."] [--json]
@@ -213,10 +221,12 @@ func runTask(task string, args []string) error {
 	labels := fs.String("labels", "", "classify: comma-separated labels")
 	question := fs.String("question", "", "triage: the yes/no/unsure question")
 	schemaPath := fs.String("schema", "", "extract: path to a JSON schema file")
+	selectFlag := fs.String("select", "", "comma-separated top-level result fields to keep")
+	compactFlag := fs.Bool("compact", false, "compact (minified) JSON output")
 	// Go's flag pkg stops at the first positional, so split the input arg out
 	// first and parse the remaining flags (allows `summarize <file> --json`).
 	positional, flagArgs := splitArgs(args, map[string]bool{
-		"config": true, "labels": true, "question": true, "schema": true, "max-points": true,
+		"config": true, "labels": true, "question": true, "schema": true, "max-points": true, "select": true,
 	})
 	_ = fs.Parse(flagArgs)
 
@@ -257,12 +267,7 @@ func runTask(task string, args []string) error {
 	defer cleanup()
 
 	res := p.Run(context.Background(), core.Request{Task: core.TaskType(task), Input: input, Params: params})
-	if *asJSON {
-		b, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Println(string(b))
-		return nil
-	}
-	printHuman(res)
+	emitResult(res, *asJSON, *selectFlag, *compactFlag)
 	return nil
 }
 
@@ -304,6 +309,146 @@ func runVQA(args []string) error {
 		return nil
 	}
 	printHuman(res)
+	return nil
+}
+
+// runVideoDescribe handles `local-offload video-describe <video-path> --question
+// "..." [--json]`. The positional argument is a LOCAL VIDEO PATH (not stdin);
+// the pipeline samples frames from it and runs the vision tier over them.
+func runVideoDescribe(args []string) error {
+	fs := flag.NewFlagSet("video-describe", flag.ExitOnError)
+	fs.String("config", "", "config file path")
+	asJSON := fs.Bool("json", false, "print full result JSON")
+	question := fs.String("question", "", "the question to ask about the video")
+	selectFlag := fs.String("select", "", "comma-separated top-level result fields to keep")
+	compactFlag := fs.Bool("compact", false, "compact (minified) JSON output")
+	positional, flagArgs := splitArgs(args, map[string]bool{
+		"config": true, "question": true, "select": true,
+	})
+	_ = fs.Parse(flagArgs)
+
+	if positional == "" || positional == "-" {
+		return fmt.Errorf("video-describe requires a video path (not stdin): local-offload video-describe <video> --question \"...\"")
+	}
+	if *question == "" {
+		return fmt.Errorf("video-describe requires --question \"...\"")
+	}
+
+	cfg := loadCfg(fs)
+	p, cleanup, err := openPipeline(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res := p.Run(context.Background(), core.Request{
+		Task:   core.TaskVideoDescribe,
+		Video:  positional,
+		Params: map[string]any{"question": *question},
+	})
+	emitResult(res, *asJSON, *selectFlag, *compactFlag)
+	return nil
+}
+
+// runTranscribe handles `local-offload transcribe <audio-path> [--language es]
+// [--hq] [--json]`. The positional argument is a LOCAL AUDIO/VIDEO PATH (not
+// stdin); the pipeline converts it to 16kHz WAV and runs whisper-server over it.
+func runTranscribe(args []string) error {
+	fs := flag.NewFlagSet("transcribe", flag.ExitOnError)
+	fs.String("config", "", "config file path")
+	asJSON := fs.Bool("json", false, "print full result JSON")
+	language := fs.String("language", "", "force language: en, es, or auto (default auto-detect)")
+	hq := fs.Bool("hq", false, "use the higher-quality large-v3 model (slower)")
+	selectFlag := fs.String("select", "", "comma-separated top-level result fields to keep (e.g. gist,language,srt_path — drops the verbose segments[])")
+	compactFlag := fs.Bool("compact", false, "compact (minified) JSON output")
+	positional, flagArgs := splitArgs(args, map[string]bool{
+		"config": true, "language": true, "select": true,
+	})
+	_ = fs.Parse(flagArgs)
+
+	if positional == "" || positional == "-" {
+		return fmt.Errorf("transcribe requires an audio path (not stdin): local-offload transcribe <audio> [--language es]")
+	}
+
+	cfg := loadCfg(fs)
+	p, cleanup, err := openPipeline(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	params := map[string]any{}
+	if *language != "" {
+		params["language"] = *language
+	}
+	if *hq {
+		params["hq"] = true
+	}
+	res := p.Run(context.Background(), core.Request{
+		Task:   core.TaskTranscribe,
+		Audio:  positional,
+		Params: params,
+	})
+	emitResult(res, *asJSON, *selectFlag, *compactFlag)
+	return nil
+}
+
+// runGenerateImage handles `local-offload generate-image "<prompt>" [--negative ...]
+// [--width N] [--height N] [--steps N] [--seed N] [--out path] [--json]`. The positional
+// argument is the PROMPT (not stdin). It renders on the LOCAL ComfyUI for free.
+func runGenerateImage(args []string) error {
+	fs := flag.NewFlagSet("generate-image", flag.ExitOnError)
+	fs.String("config", "", "config file path")
+	asJSON := fs.Bool("json", false, "print full result JSON")
+	negative := fs.String("negative", "", "negative prompt (hard exclusions, e.g. 'people, text')")
+	out := fs.String("out", "", "output PNG path (default under the media dir)")
+	width := fs.Int("width", 0, "image width px (default 1024)")
+	height := fs.Int("height", 0, "image height px (default 1024)")
+	steps := fs.Int("steps", 0, "sampler steps (default 30)")
+	seed := fs.Int("seed", 0, "RNG seed (default random)")
+	compactFlag := fs.Bool("compact", false, "compact (minified) JSON output")
+	positional, flagArgs := splitArgs(args, map[string]bool{
+		"config": true, "negative": true, "out": true,
+		"width": true, "height": true, "steps": true, "seed": true,
+	})
+	_ = fs.Parse(flagArgs)
+
+	if positional == "" || positional == "-" {
+		return fmt.Errorf("generate-image requires a prompt (not stdin): local-offload generate-image \"<prompt>\" [--width 1024]")
+	}
+
+	cfg := loadCfg(fs)
+	p, cleanup, err := openPipeline(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	params := map[string]any{}
+	if *negative != "" {
+		params["negative"] = *negative
+	}
+	if *out != "" {
+		params["out"] = *out
+	}
+	if *width > 0 {
+		params["width"] = *width
+	}
+	if *height > 0 {
+		params["height"] = *height
+	}
+	if *steps > 0 {
+		params["steps"] = *steps
+	}
+	if *seed > 0 {
+		params["seed"] = *seed
+	}
+	res := p.Run(context.Background(), core.Request{
+		Task:   core.TaskGenerateImage,
+		Input:  positional,
+		Params: params,
+	})
+	emitResult(res, *asJSON, "", *compactFlag)
 	return nil
 }
 
@@ -464,6 +609,28 @@ func printHuman(res core.Result) {
 		map[bool]string{true: ", cache hit", false: ""}[res.Meta.CacheHit])
 }
 
+// emitResult prints a Result, optionally projecting its Data to the --select
+// fields and/or minifying with --compact. This is the harness's fastcontext
+// citation pattern at the output layer: the caller keeps only the fields it
+// needs (e.g. `transcribe --select gist,srt_path` drops the verbose segments[]).
+// selectCSV "" / compact false reproduces the prior plain behavior exactly.
+func emitResult(res core.Result, asJSON bool, selectCSV string, compact bool) {
+	if keys := core.SelectKeys(selectCSV); len(keys) > 0 {
+		res.Data = core.ProjectFields(res.Data, keys)
+	}
+	if asJSON {
+		var b []byte
+		if compact {
+			b, _ = json.Marshal(res)
+		} else {
+			b, _ = json.MarshalIndent(res, "", "  ")
+		}
+		fmt.Println(string(b))
+		return
+	}
+	printHuman(res)
+}
+
 func runMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	fs.String("config", "", "config file path")
@@ -524,7 +691,8 @@ func runModels(args []string) error {
 	fmt.Println("Gemma-4 QAT family cascade (ascending capability; climbs on quality failure):")
 	fmt.Printf("  fast   triage,classify -> %s  (~120 tok/s, entry tier)\n", orDash(cfg.TriageModel))
 	fmt.Printf("  work   summarize,extract -> %s  (~83 tok/s, default workhorse)\n", orDash(cfg.Model))
-	fmt.Printf("  escal  on validation/low-confidence -> %s  (MoE, ~16 tok/s, near-frontier)\n", orDash(cfg.EscalationModel))
+	fmt.Printf("  escal  on validation/low-confidence -> %s  (Qwen3.5-9B dense, 5.6 GB Q4_K_M, ~26 tok/s warm; ties gemma4-26b-a4b on the gold set)\n", orDash(cfg.EscalationModel))
+	fmt.Printf("  reason grammar-task deferral, pre-Opus -> %s  (think-wrapped GBNF; reclaims the defer, counted as reasoning_reclaims)\n", orDash(cfg.ReasoningModel))
 	fmt.Println("  defer  all local tiers fail -> Opus (structured defer; harness never calls cloud)")
 	fmt.Println()
 	fmt.Println("Per-tier llama-server flags are grammar-reliable (NO MTP; MTP breaks GBNF):")
@@ -1068,7 +1236,7 @@ func runEval(args []string) error {
 		AUDC         float64 `json:"audc"`          // cascade cost-quality area
 		QNC          float64 `json:"qnc"`           // min norm cost to match peak quality
 		PeakQuality  float64 `json:"peak_quality"`
-		AURC         float64 `json:"aurc,omitempty"`  // selective prediction (triage/classify)
+		AURC         float64 `json:"aurc,omitempty"` // selective prediction (triage/classify)
 		EAURC        float64 `json:"eaurc,omitempty"`
 		AURCApplies  bool    `json:"aurc_applies"`
 	}

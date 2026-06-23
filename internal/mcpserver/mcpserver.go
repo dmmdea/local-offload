@@ -92,6 +92,45 @@ func (s *Server) Run(ctx context.Context, version string) error {
 	})
 
 	srv.AddTool(&mcp.Tool{
+		Name:        "offload_video_describe",
+		Description: "Answer a question about a VIDEO on a free local vision model. It samples frames from the video and reasons over them. video is a LOCAL file path; question is what to ask. Returns {answer} (which notes what the relevant frames show); if it can't answer confidently it returns deferred:true and you should watch the video yourself.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"video":{"type":"string","description":"local video file path"},"question":{"type":"string","description":"the question to answer about the video"}},"required":["video","question"]}`),
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var in struct {
+			Video    string `json:"video"`
+			Question string `json:"question"`
+		}
+		_ = json.Unmarshal(req.Params.Arguments, &in)
+		return result(s.p.Run(ctx, core.Request{Task: core.TaskVideoDescribe, Video: in.Video, Params: map[string]any{"question": in.Question}}))
+	})
+
+	srv.AddTool(&mcp.Tool{
+		Name:        "offload_transcribe",
+		Description: "Transcribe a local AUDIO or VIDEO file to text on a free local whisper model (STT). audio is a LOCAL file path (mp3/m4a/wav/mp4/...); language is optional ('en','es', or 'auto' — default auto-detect); set hq=true for the higher-quality (slower) model on hard/noisy clips. Returns {gist (preview), language, duration_sec, num_segments, segments[{id,start,end,text}] (timestamped spans — pull only the ones you need), srt_path, text_path, json_path}. The full transcript + SRT are written to disk; read the spans/paths you need. If it can't transcribe confidently it returns deferred:true and you should handle the audio yourself.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"audio":{"type":"string","description":"local audio or video file path"},"language":{"type":"string","description":"en, es, or auto (default auto-detect)"},"hq":{"type":"boolean","description":"use the higher-quality large-v3 model (slower) for hard/noisy audio"},"select":{"type":"array","items":{"type":"string"},"description":"optional: return ONLY these top-level result fields (e.g. [\"gist\",\"language\",\"num_segments\",\"srt_path\"]) to skip the verbose segments[] and keep your context lean — read the full transcript/spans from srt_path or json_path when you need them"}},"required":["audio"]}`),
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var in struct {
+			Audio    string   `json:"audio"`
+			Language string   `json:"language"`
+			HQ       bool     `json:"hq"`
+			Select   []string `json:"select"`
+		}
+		_ = json.Unmarshal(req.Params.Arguments, &in)
+		params := map[string]any{}
+		if in.Language != "" {
+			params["language"] = in.Language
+		}
+		if in.HQ {
+			params["hq"] = true
+		}
+		res := s.p.Run(ctx, core.Request{Task: core.TaskTranscribe, Audio: in.Audio, Params: params})
+		if len(in.Select) > 0 {
+			res.Data = core.ProjectFields(res.Data, in.Select)
+		}
+		return result(res)
+	})
+
+	srv.AddTool(&mcp.Tool{
 		Name:        "offload_extract_image",
 		Description: "Extract structured fields from an IMAGE on a free local model: it OCRs the image, then extracts the fields from the transcribed text constrained to the provided JSON schema (values are grounded against the OCR text). image is a local file path or a data:image/... URI; schema is a JSON schema with a properties object. Returns the extracted object or defers.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"image":{"type":"string","description":"local image file path or a data:image/...;base64 URI"},"schema":{"type":"object","description":"JSON schema with a properties object describing the fields to extract"}},"required":["image","schema"]}`),
@@ -131,6 +170,43 @@ func (s *Server) Run(ctx context.Context, version string) error {
 		}
 		_ = json.Unmarshal(req.Params.Arguments, &in)
 		return result(s.p.Run(ctx, core.Request{Task: core.TaskOCR, Image: in.Image}))
+	})
+
+	srv.AddTool(&mcp.Tool{
+		Name:        "offload_generate_image",
+		Description: "Generate an IMAGE from a text prompt on the LOCAL ComfyUI (SDXL/RealVisXL) for FREE — no cloud, runs on the local GPU. prompt is required; optional: negative (hard exclusions like 'people, text, watermark' — SDXL enforces these at CFG 7), width/height (default 1024), steps (default 30), seed (for reproducibility), out (output PNG path; default under the media dir). It auto-starts ComfyUI and takes the shared single-slot GPU lock, so it serializes with other local gen/inference and may wait. First call cold-starts ComfyUI (~4min) + renders (~6min); warm calls are faster. Returns {image_path, width, height, seed}. On any failure (GPU busy, ComfyUI down, render error, timeout) it returns deferred:true — then generate the image another way.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"prompt":{"type":"string","description":"positive text prompt describing the image"},"negative":{"type":"string","description":"hard exclusions, e.g. people, text, watermark"},"out":{"type":"string","description":"output PNG path (optional; default under the media dir)"},"width":{"type":"integer","description":"width px (default 1024)"},"height":{"type":"integer","description":"height px (default 1024)"},"steps":{"type":"integer","description":"sampler steps (default 30)"},"seed":{"type":"integer","description":"RNG seed for reproducibility"}},"required":["prompt"]}`),
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var in struct {
+			Prompt   string `json:"prompt"`
+			Negative string `json:"negative"`
+			Out      string `json:"out"`
+			Width    int    `json:"width"`
+			Height   int    `json:"height"`
+			Steps    int    `json:"steps"`
+			Seed     int    `json:"seed"`
+		}
+		_ = json.Unmarshal(req.Params.Arguments, &in)
+		params := map[string]any{}
+		if in.Negative != "" {
+			params["negative"] = in.Negative
+		}
+		if in.Out != "" {
+			params["out"] = in.Out
+		}
+		if in.Width > 0 {
+			params["width"] = in.Width
+		}
+		if in.Height > 0 {
+			params["height"] = in.Height
+		}
+		if in.Steps > 0 {
+			params["steps"] = in.Steps
+		}
+		if in.Seed > 0 {
+			params["seed"] = in.Seed
+		}
+		return result(s.p.Run(ctx, core.Request{Task: core.TaskGenerateImage, Input: in.Prompt, Params: params}))
 	})
 
 	return srv.Run(ctx, &mcp.StdioTransport{})

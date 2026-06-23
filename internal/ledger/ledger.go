@@ -34,6 +34,7 @@ type Entry struct {
 	Margin          float64            `json:"margin,omitempty"`
 	ModelTier       string             `json:"model_tier,omitempty"`
 	Escalations     int                `json:"escalations,omitempty"`
+	Reasoning       bool               `json:"reasoning,omitempty"` // produced by the terminal reasoning tier (a reclaimed deferral)
 	Retries         int                `json:"retries,omitempty"`
 	Truncated       bool               `json:"truncated,omitempty"`
 	Grounded        *bool              `json:"grounded,omitempty"`
@@ -132,14 +133,15 @@ func ReadLabelFile(path string) ([]Entry, error) {
 
 // Summary aggregates the ledger.
 type Summary struct {
-	Calls          int            `json:"calls"`
-	CacheHits      int            `json:"cache_hits"`
-	Deferred       int            `json:"deferred"`
-	Completed      int            `json:"completed"`
-	TokensSaved    int            `json:"tokens_saved"` // input tokens kept out of Opus on completed/cache calls
-	TokensOut      int            `json:"tokens_out"`
-	EstDollarSaved float64        `json:"est_dollar_saved"`
-	ByTask         map[string]int `json:"by_task"`
+	Calls             int            `json:"calls"`
+	CacheHits         int            `json:"cache_hits"`
+	Deferred          int            `json:"deferred"`
+	Completed         int            `json:"completed"`
+	ReasoningReclaims int            `json:"reasoning_reclaims"` // completed via the terminal reasoning tier (deferrals it reclaimed before Opus)
+	TokensSaved       int            `json:"tokens_saved"`       // input tokens kept out of Opus on completed/cache calls
+	TokensOut         int            `json:"tokens_out"`
+	EstDollarSaved    float64        `json:"est_dollar_saved"`
+	ByTask            map[string]int `json:"by_task"`
 }
 
 // Summarize aggregates this ledger's file since `since` (unix; 0 = all).
@@ -213,6 +215,9 @@ func SummarizeFile(path string, since int64, opusPricePerMTok float64) (Summary,
 			s.Completed++
 			s.TokensSaved += e.TokensIn
 			s.TokensOut += e.TokensOut
+			if e.Reasoning {
+				s.ReasoningReclaims++ // a completed reasoning entry = a deferral reclaimed before Opus
+			}
 		}
 	}
 	s.EstDollarSaved = float64(s.TokensSaved) / 1_000_000 * opusPricePerMTok
