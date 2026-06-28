@@ -8,7 +8,6 @@ A local-first harness that offloads short-context, low-judgment work — **summa
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Go Reference](https://pkg.go.dev/badge/github.com/dmmdea/offload-harness.svg)](https://pkg.go.dev/github.com/dmmdea/offload-harness)
-[![Go Report Card](https://goreportcard.com/badge/github.com/dmmdea/offload-harness)](https://goreportcard.com/report/github.com/dmmdea/offload-harness)
 [![CI](https://img.shields.io/github/actions/workflow/status/dmmdea/offload-harness/ci.yml?branch=main)](../../actions)
 [![MCP](https://img.shields.io/badge/MCP-stdio-purple.svg)](https://modelcontextprotocol.io)
 
