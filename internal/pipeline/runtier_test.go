@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/cache"
-	"github.com/dmmdea/local-offload-pp-cli/internal/config"
-	"github.com/dmmdea/local-offload-pp-cli/internal/core"
-	"github.com/dmmdea/local-offload-pp-cli/internal/ledger"
-	"github.com/dmmdea/local-offload-pp-cli/internal/llamaclient"
-	"github.com/dmmdea/local-offload-pp-cli/internal/shadow"
-	"github.com/dmmdea/local-offload-pp-cli/internal/tasks"
+	"github.com/dmmdea/offload-harness/internal/cache"
+	"github.com/dmmdea/offload-harness/internal/config"
+	"github.com/dmmdea/offload-harness/internal/core"
+	"github.com/dmmdea/offload-harness/internal/ledger"
+	"github.com/dmmdea/offload-harness/internal/llamaclient"
+	"github.com/dmmdea/offload-harness/internal/shadow"
+	"github.com/dmmdea/offload-harness/internal/tasks"
 )
 
 // newTestPipelineWithLedger builds a Pipeline wired to the given httptest server,

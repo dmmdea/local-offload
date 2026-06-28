@@ -187,7 +187,7 @@ func Default() Config {
 		STTRequestTimeoutSec:      1800,
 		MediaDir:                  filepath.Join(base, "media"),
 		SVGDir:                    filepath.Join(base, "svg"),
-		ImageGenScript:            "D:/repos/local-offload/render/comfy-generate.mjs",
+		ImageGenScript:            "",
 		NodePath:                  "node",
 		ComfyDir:                  "C:/ComfyUI",
 		ImageGenTimeoutSec:        720,

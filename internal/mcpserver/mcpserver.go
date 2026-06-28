@@ -10,8 +10,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/core"
-	"github.com/dmmdea/local-offload-pp-cli/internal/pipeline"
+	"github.com/dmmdea/offload-harness/internal/core"
+	"github.com/dmmdea/offload-harness/internal/pipeline"
 )
 
 type Server struct{ p *pipeline.Pipeline }

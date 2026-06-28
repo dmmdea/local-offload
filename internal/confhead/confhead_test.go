@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/ledger"
+	"github.com/dmmdea/offload-harness/internal/ledger"
 )
 
 func bptr(v bool) *bool { return &v }

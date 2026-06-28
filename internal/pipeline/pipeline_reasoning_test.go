@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/config"
-	"github.com/dmmdea/local-offload-pp-cli/internal/core"
-	"github.com/dmmdea/local-offload-pp-cli/internal/llamaclient"
+	"github.com/dmmdea/offload-harness/internal/config"
+	"github.com/dmmdea/offload-harness/internal/core"
+	"github.com/dmmdea/offload-harness/internal/llamaclient"
 )
 
 // reasoningServer: the entry (TriageModel) + workhorse (Model) tiers DEFER (empty output);

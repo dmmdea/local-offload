@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/imageio"
+	"github.com/dmmdea/offload-harness/internal/imageio"
 )
 
 // buildFFmpegArgs builds the ffmpeg argument list: decode videoPath, sample at

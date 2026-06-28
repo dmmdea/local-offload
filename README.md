@@ -7,9 +7,9 @@
 A local-first harness that offloads short-context, low-judgment work — **summarize · classify · extract · triage** (plus vision, OCR, transcription, and image/SVG generation) — to a free **Gemma-family cascade** served by [llama.cpp](https://github.com/ggml-org/llama.cpp). It runs as a Go CLI and as an **MCP server** for AI coding agents. It **never calls a cloud model**: when it can't do a task confidently, it returns a structured **defer** so your agent handles it.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Go Reference](https://pkg.go.dev/badge/github.com/dmmdea/local-offload-pp-cli.svg)](https://pkg.go.dev/github.com/dmmdea/local-offload-pp-cli)
-[![Go Report Card](https://goreportcard.com/badge/github.com/dmmdea/local-offload-pp-cli)](https://goreportcard.com/report/github.com/dmmdea/local-offload-pp-cli)
-[![CI](https://img.shields.io/github/actions/workflow/status/dmmdea/local-offload-pp-cli/ci.yml?branch=main)](../../actions)
+[![Go Reference](https://pkg.go.dev/badge/github.com/dmmdea/offload-harness.svg)](https://pkg.go.dev/github.com/dmmdea/offload-harness)
+[![Go Report Card](https://goreportcard.com/badge/github.com/dmmdea/offload-harness)](https://goreportcard.com/report/github.com/dmmdea/offload-harness)
+[![CI](https://img.shields.io/github/actions/workflow/status/dmmdea/offload-harness/ci.yml?branch=main)](../../actions)
 [![MCP](https://img.shields.io/badge/MCP-stdio-purple.svg)](https://modelcontextprotocol.io)
 
 </div>
@@ -59,15 +59,15 @@ First output in under five commands. If the local model is unreachable or unsure
 **Build from source** (recommended):
 
 ```bash
-git clone https://github.com/dmmdea/local-offload-pp-cli.git
-cd local-offload-pp-cli
+git clone https://github.com/dmmdea/offload-harness.git
+cd offload-harness
 go build -o offload-harness .       # or: go build -o offload-harness.exe . on Windows
 ```
 
 **Go install:**
 
 ```bash
-go install github.com/dmmdea/local-offload-pp-cli@latest
+go install github.com/dmmdea/offload-harness@latest
 ```
 
 Requires **Go 1.26+** and a running **llama.cpp server** (see [Serving the models](#serving-the-models)).

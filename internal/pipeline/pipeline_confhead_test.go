@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/confhead"
-	"github.com/dmmdea/local-offload-pp-cli/internal/config"
-	"github.com/dmmdea/local-offload-pp-cli/internal/core"
-	"github.com/dmmdea/local-offload-pp-cli/internal/ledger"
-	"github.com/dmmdea/local-offload-pp-cli/internal/llamaclient"
+	"github.com/dmmdea/offload-harness/internal/confhead"
+	"github.com/dmmdea/offload-harness/internal/config"
+	"github.com/dmmdea/offload-harness/internal/core"
+	"github.com/dmmdea/offload-harness/internal/ledger"
+	"github.com/dmmdea/offload-harness/internal/llamaclient"
 )
 
 // summaryInput is comfortably above the trivial-input floor so the call is

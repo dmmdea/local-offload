@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/ledger"
+	"github.com/dmmdea/offload-harness/internal/ledger"
 )
 
 // point is one labeled (margin, correct) observation.

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dmmdea/local-offload-pp-cli/internal/config"
-	"github.com/dmmdea/local-offload-pp-cli/internal/core"
+	"github.com/dmmdea/offload-harness/internal/config"
+	"github.com/dmmdea/offload-harness/internal/core"
 )
 
 func TestRunGenerateSVG_WritesFile(t *testing.T) {
