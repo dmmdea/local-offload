@@ -36,7 +36,7 @@ import (
 	"github.com/dmmdea/offload-harness/internal/shadow"
 )
 
-const version = "0.1.0"
+const version = "0.4.1"
 
 func main() {
 	sub, args, ok := hoistGlobalConfig(os.Args[1:])
@@ -181,15 +181,41 @@ A bare {"field":"string"} map has no usable properties and is deferred.
 }
 
 func loadCfg(fs *flag.FlagSet) config.Config {
-	path := fs.Lookup("config").Value.String()
-	if path == "" {
-		path = os.Getenv("LOCAL_OFFLOAD_CONFIG")
-	}
+	home, _ := os.UserHomeDir()
+	path := resolveCfgPath(
+		fs.Lookup("config").Value.String(),
+		os.Getenv("LOCAL_OFFLOAD_CONFIG"),
+		home,
+		func(p string) bool { info, statErr := os.Stat(p); return statErr == nil && !info.IsDir() },
+	)
 	cfg, err := config.Load(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning: config load failed, using defaults:", err)
 	}
 	return cfg
+}
+
+// resolveCfgPath picks the config file by precedence: explicit --config flag >
+// $LOCAL_OFFLOAD_CONFIG > the conventional ~/.local-offload/config.json if it
+// exists > "" (built-in defaults). The conventional-path fallback is the fix for
+// a bare `local-offload mcp` spawned by an MCP host that passes neither flag nor
+// env (as the registration did): without it the server silently ran on defaults
+// with ShadowEnabled=false, so capture never fired and the flywheel starved.
+// exists is injected so the precedence is unit-testable without touching disk.
+func resolveCfgPath(flagPath, envPath, home string, exists func(string) bool) string {
+	if flagPath != "" {
+		return flagPath
+	}
+	if envPath != "" {
+		return envPath
+	}
+	if home != "" {
+		def := filepath.Join(home, ".local-offload", "config.json")
+		if exists(def) {
+			return def
+		}
+	}
+	return ""
 }
 
 func openPipeline(cfg config.Config) (*pipeline.Pipeline, func(), error) {
